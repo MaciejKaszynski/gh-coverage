@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# gh coverage <PR-NUMBER> [-R owner/repo]
+# Downloads the coverage artifact of the latest "Code coverage" run for a PR's
+# branch, unzips it to <output_dir>/<PR>-<RUN>-coverage/ and opens <index> (see --help).
+set -euo pipefail
+
+log() { echo "[gh-coverage] $*" >&2; }
+
+# Settings, lowest to highest precedence:
+#   defaults < config file < GH_COVERAGE_* env vars < command-line flags
+# Config file: ${XDG_CONFIG_HOME:-~/.config}/gh-coverage/config, KEY=value lines
+# (keys: repo, artifact, output_dir, index; '#' starts a comment). Not sourced.
+repo="" artifact="coverage-html" output_dir="/tmp" index_path="coverage_linux/index.html"
+
+config="${GH_COVERAGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-coverage/config}"
+if [[ -f "$config" ]]; then
+  log "reading config $config"
+  while IFS='=' read -r key val; do
+    key="${key//[[:space:]]/}"; val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+    val="${val%\"}"; val="${val#\"}"
+    case "$key" in
+      repo) repo="$val" ;;
+      artifact) artifact="$val" ;;
+      output_dir) output_dir="${val/#\~/$HOME}" ;;
+      index) index_path="$val" ;;
+      ''|\#*) ;;
+      *) log "ignoring unknown config key '$key'" ;;
+    esac
+  done < "$config"
+fi
+
+repo="${GH_COVERAGE_REPO:-$repo}"
+artifact="${GH_COVERAGE_ARTIFACT:-$artifact}"
+output_dir="${GH_COVERAGE_OUTPUT_DIR:-$output_dir}"
+index_path="${GH_COVERAGE_INDEX:-$index_path}"
+
+usage() {
+  cat >&2 <<USAGE
+Usage: gh coverage <PR-NUMBER> [options]
+  -R, --repo OWNER/REPO   repository (default: current repo)
+  -o, --output-dir DIR    base dir for <PR>-<RUN>-coverage (default: $output_dir)
+  -i, --index PATH        file to open, relative to the extracted dir (default: $index_path)
+  -a, --artifact NAME     artifact name (default: $artifact)
+Config file: $config
+USAGE
+  exit 1
+}
+
+pr=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -R|--repo) repo="${2:-}"; shift 2 ;;
+    -o|--output-dir) output_dir="${2:-}"; shift 2 ;;
+    -i|--index) index_path="${2:-}"; shift 2 ;;
+    -a|--artifact) artifact="${2:-}"; shift 2 ;;
+    -h|--help) usage ;;
+    *) pr="$1"; shift ;;
+  esac
+done
+[[ "$pr" =~ ^[0-9]+$ ]] || usage
+
+[[ -n "$repo" ]] || repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+log "repo: $repo"
+
+read -r branch sha < <(gh pr view "$pr" -R "$repo" --json headRefName,headRefOid \
+                         --jq '[.headRefName,.headRefOid]|@tsv')
+log "PR #$pr head branch: $branch, head sha: $sha"
+
+# Coverage is produced inside a (reusable) workflow, so the artifact lives on
+# the calling run (e.g. "PR"). Look at runs for the head commit, newest first.
+log "looking for runs at $sha with artifact '$artifact'"
+run=""
+while IFS=$'\t' read -r id name event status conclusion; do
+  log "  run $id: workflow='$name' event=$event status=$status conclusion=${conclusion:-none}"
+  match=$(gh api "repos/$repo/actions/runs/$id/artifacts?per_page=100" \
+            --jq "[.artifacts[]|select(.name==\"$artifact\" and (.expired|not))]|length")
+  if [[ "$match" -gt 0 ]]; then
+    log "  -> found non-expired '$artifact' artifact"
+    run="$id"; break
+  fi
+  log "  -> no '$artifact' artifact"
+done < <(gh api "repos/$repo/actions/runs?head_sha=$sha&per_page=100" \
+           --jq '.workflow_runs|sort_by(.created_at)|reverse|.[]|[.id,.name,.event,.status,.conclusion]|@tsv')
+
+[[ -n "$run" ]] || { log "no run with artifact '$artifact' for $sha (set --artifact or GH_COVERAGE_ARTIFACT to override)"; exit 1; }
+
+out="${output_dir%/}/${pr}-${run}-coverage"
+rm -rf "$out"; mkdir -p "$out"
+log "downloading '$artifact' from run $run -> $out"
+gh run download "$run" -R "$repo" -n "$artifact" -D "$out"
+
+# Artifact may itself contain a zip; unpack nested zips.
+while IFS= read -r -d '' z; do
+  log "unzipping nested $z"
+  unzip -q -o "$z" -d "$(dirname "$z")" && rm -- "$z"
+done < <(find "$out" -name '*.zip' -print0)
+
+index="$out/$index_path"
+[[ -f "$index" ]] || { log "$index not found; contents of $out:"; ls -R "$out" >&2; exit 1; }
+log "opening $index"
+xdg-open "$index" >/dev/null 2>&1 &

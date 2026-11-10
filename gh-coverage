@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# gh coverage <PR-NUMBER> [-R owner/repo]
-# Downloads the coverage artifact of the latest "Code coverage" run for a PR's
-# branch, unzips it to <output_dir>/<PR>-<RUN>-coverage/ and opens <index> (see --help).
+# gh coverage <PR-NUMBER | BRANCH> [-R owner/repo]
+# Downloads the coverage artifact of the latest run for a PR's head commit (or,
+# given a branch name such as "main", the latest run on that branch), unzips it
+# to <output_dir>/<PR|BRANCH>-<RUN>-coverage/ and opens <index> (see --help).
 set -euo pipefail
 
 log() { echo "[gh-coverage] $*" >&2; }
@@ -9,8 +10,8 @@ log() { echo "[gh-coverage] $*" >&2; }
 # Settings, lowest to highest precedence:
 #   defaults < config file < GH_COVERAGE_* env vars < command-line flags
 # Config file: ${XDG_CONFIG_HOME:-~/.config}/gh-coverage/config, KEY=value lines
-# (keys: repo, artifact, output_dir, index; '#' starts a comment). Not sourced.
-repo="" artifact="coverage-html" output_dir="/tmp" index_path="coverage_linux/index.html"
+# (keys: repo, artifact, workflow, output_dir, index; '#' starts a comment). Not sourced.
+repo="" artifact="coverage-html" workflow="PR" output_dir="/tmp" index_path="coverage_linux/index.html"
 
 config="${GH_COVERAGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-coverage/config}"
 if [[ -f "$config" ]]; then
@@ -21,6 +22,7 @@ if [[ -f "$config" ]]; then
     case "$key" in
       repo) repo="$val" ;;
       artifact) artifact="$val" ;;
+      workflow) workflow="$val" ;;
       output_dir) output_dir="${val/#\~/$HOME}" ;;
       index) index_path="$val" ;;
       ''|\#*) ;;
@@ -31,44 +33,56 @@ fi
 
 repo="${GH_COVERAGE_REPO:-$repo}"
 artifact="${GH_COVERAGE_ARTIFACT:-$artifact}"
+workflow="${GH_COVERAGE_WORKFLOW:-$workflow}"
 output_dir="${GH_COVERAGE_OUTPUT_DIR:-$output_dir}"
 index_path="${GH_COVERAGE_INDEX:-$index_path}"
 
 usage() {
   cat >&2 <<USAGE
-Usage: gh coverage <PR-NUMBER> [options]
+Usage: gh coverage <PR-NUMBER | BRANCH> [options]
   -R, --repo OWNER/REPO   repository (default: current repo)
-  -o, --output-dir DIR    base dir for <PR>-<RUN>-coverage (default: $output_dir)
+  -o, --output-dir DIR    base dir for <PR|BRANCH>-<RUN>-coverage (default: $output_dir)
   -i, --index PATH        file to open, relative to the extracted dir (default: $index_path)
   -a, --artifact NAME     artifact name (default: $artifact)
+  -w, --workflow NAME     only consider runs with this name (default: $workflow)
 Config file: $config
 USAGE
   exit 1
 }
 
-pr=""
+target=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -R|--repo) repo="${2:-}"; shift 2 ;;
     -o|--output-dir) output_dir="${2:-}"; shift 2 ;;
     -i|--index) index_path="${2:-}"; shift 2 ;;
     -a|--artifact) artifact="${2:-}"; shift 2 ;;
+    -w|--workflow) workflow="${2:-}"; shift 2 ;;
     -h|--help) usage ;;
-    *) pr="$1"; shift ;;
+    *) target="$1"; shift ;;
   esac
 done
-[[ "$pr" =~ ^[0-9]+$ ]] || usage
+[[ -n "$target" ]] || usage
 
 [[ -n "$repo" ]] || repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 log "repo: $repo"
 
-read -r branch sha < <(gh pr view "$pr" -R "$repo" --json headRefName,headRefOid \
-                         --jq '[.headRefName,.headRefOid]|@tsv')
-log "PR #$pr head branch: $branch, head sha: $sha"
+if [[ "$target" =~ ^[0-9]+$ ]]; then
+  read -r branch sha < <(gh pr view "$target" -R "$repo" --json headRefName,headRefOid \
+                           --jq '[.headRefName,.headRefOid]|@tsv')
+  log "PR #$target head branch: $branch, head sha: $sha"
+  runs_query="head_sha=$sha"
+  what="$sha"
+else
+  log "branch: $target"
+  runs_query="branch=$target"
+  what="branch $target"
+fi
 
 # Coverage is produced inside a (reusable) workflow, so the artifact lives on
-# the calling run (e.g. "PR"). Look at runs for the head commit, newest first.
-log "looking for runs at $sha with artifact '$artifact'"
+# the calling run. Only runs named "$workflow" are considered; look at runs for the head commit (or branch),
+# newest first.
+log "looking for runs named '$workflow' at $what with artifact '$artifact'"
 run=""
 while IFS=$'\t' read -r id name event status conclusion; do
   log "  run $id: workflow='$name' event=$event status=$status conclusion=${conclusion:-none}"
@@ -79,12 +93,12 @@ while IFS=$'\t' read -r id name event status conclusion; do
     run="$id"; break
   fi
   log "  -> no '$artifact' artifact"
-done < <(gh api "repos/$repo/actions/runs?head_sha=$sha&per_page=100" \
-           --jq '.workflow_runs|sort_by(.created_at)|reverse|.[]|[.id,.name,.event,.status,.conclusion]|@tsv')
+done < <(GH_COVERAGE_WORKFLOW="$workflow" gh api "repos/$repo/actions/runs?$runs_query&per_page=100" \
+           --jq '.workflow_runs|map(select(.name==$ENV.GH_COVERAGE_WORKFLOW))|sort_by(.created_at)|reverse|.[]|[.id,.name,.event,.status,.conclusion]|@tsv')
 
-[[ -n "$run" ]] || { log "no run with artifact '$artifact' for $sha (set --artifact or GH_COVERAGE_ARTIFACT to override)"; exit 1; }
+[[ -n "$run" ]] || { log "no run named '$workflow' with artifact '$artifact' for $what (set --workflow/--artifact or GH_COVERAGE_WORKFLOW/GH_COVERAGE_ARTIFACT to override)"; exit 1; }
 
-out="${output_dir%/}/${pr}-${run}-coverage"
+out="${output_dir%/}/${target//\//_}-${run}-coverage"
 rm -rf "$out"; mkdir -p "$out"
 log "downloading '$artifact' from run $run -> $out"
 gh run download "$run" -R "$repo" -n "$artifact" -D "$out"
